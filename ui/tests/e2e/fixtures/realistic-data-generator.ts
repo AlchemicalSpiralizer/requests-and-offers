@@ -126,7 +126,7 @@ export class RealisticDataGenerator {
     { code: 'EUR', name: 'Euro' },
     { code: 'CAD', name: 'Canadian Dollar' },
     { code: 'GBP', name: 'British Pound' },
-    { code: 'PAY_IT_FORWARD', name: 'Pay it Forward' },
+    { code: 'PAY_IT_FORWARD', name: 'Free/Pay it Forward' },
     { code: 'SKILL_EXCHANGE', name: 'Skill Exchange' },
     { code: 'TIME_BANKING', name: 'Time Banking' },
     { code: 'BARTER', name: 'Barter System' }
