@@ -13,6 +13,7 @@ serde = { workspace = true }
 holochain_serialized_bytes = { workspace = true }
 thiserror = { workspace = true }
 
+utils = { workspace = true }
 conversation_integrity = { workspace = true }
 
 [dev-dependencies]

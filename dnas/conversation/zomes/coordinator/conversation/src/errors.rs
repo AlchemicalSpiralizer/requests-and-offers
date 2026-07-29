@@ -1,52 +1,39 @@
-use hdk::prelude::{wasm_error, SerializedBytesError, WasmError, WasmErrorInner};
+use hdk::prelude::{wasm_error, WasmError, WasmErrorInner};
 use thiserror::Error;
 
-/// Local to this DNA rather than `utils::errors::CommonError`.
+/// Conversation-specific errors only. Anything with a `CommonError` equivalent
+/// uses `utils::errors::CommonError` instead.
 ///
-/// `utils` was the obvious choice and is the wrong one. It exports `DnaProperties`
-/// (`dnas/requests_and_offers/utils/src/dna_properties.rs` line 6), typed for the shared
-/// DNA's `progenitor_pubkey: Option<String>` and read through
-/// `DnaProperties::get_progenitor_pubkey` (`utils/src/lib.rs` line 17). This DNA's
-/// properties are `progenitor: AgentPubKey` plus `conversation_id`, so depending on `utils`
-/// would put a wrong-shaped properties reader in scope in a DNA it cannot read. That is a
-/// trap laid for whoever touches this next, and it costs about ten lines to avoid.
+/// This follows the house pattern of a domain enum *alongside* `CommonError`
+/// rather than instead of it, as `UsersError`, `OrganizationsError` and
+/// `AdministrationError` do in `dnas/requests_and_offers/utils/src/errors.rs`.
 ///
-/// The `image` crate (`utils/Cargo.toml`) is a secondary consideration only. It is a real
-/// dependency, referenced at `utils/src/lib.rs` lines 12 and 126, so whether the linker
-/// drops it from a wasm that never calls `is_image` is unmeasured. Size was never the
-/// disqualifying argument.
+/// An earlier revision duplicated `CommonError` here to avoid depending on
+/// `utils` at all. The reason was that `utils` exports a `DnaProperties` typed
+/// for the shared DNA, and serde silently accepted this DNA's properties as a
+/// progenitorless read, so a reader reaching for the obvious helper would get a
+/// wrong answer that looked like dev mode. That trap is now closed at source by
+/// `#[serde(deny_unknown_fields)]`, so the duplication bought nothing and cost
+/// real fidelity: `From<CommonError> for WasmError` is a hand-written match that
+/// distinguishes `Memory`, `Serialize`, `Deserialize` and `Host`, where a local
+/// enum flattens everything to `Guest`.
 ///
-/// Message strings below deliberately match `CommonError`'s wording, so anything matching
-/// on rendered error text behaves identically across the two DNAs.
+/// Imports of `utils` stay selective, matching every one of the eleven crates
+/// that depend on it. There are no glob imports of `utils` anywhere in the
+/// repository and there should not be one here.
 #[derive(Debug, Error)]
 pub enum ConversationError {
-  #[error("Serialization error: {0}")]
-  Serialize(SerializedBytesError),
-
-  #[error("Entry not found: {0}")]
-  EntryNotFound(String),
-
-  #[error("Record not found: {0}")]
-  RecordNotFound(String),
-
-  #[error("Link not found: {0}")]
-  LinkNotFound(String),
-
-  #[error("Path error: {0}")]
-  PathError(String),
-
-  #[error("Invalid data: {0}")]
-  InvalidData(String),
-
+  /// `UsersError::NotAuthor` exists but belongs to the users domain in the
+  /// shared DNA, and this DNA has no users.
   #[error("Not the author")]
   NotAuthor,
 
-  /// No `CommonError` equivalent. The shared DNA has one progenitor for the whole network;
-  /// a conversation clone has one per conversation, and it is the member who started it.
+  /// The shared DNA has one progenitor for the whole network. A conversation
+  /// clone has one per conversation, and it is the member who started it.
   #[error("Only the conversation's progenitor may issue membrane proofs")]
   NotProgenitor,
 
-  /// No `CommonError` equivalent. See `conversation_properties` in `lib.rs`.
+  /// See `conversation_properties` in `lib.rs`.
   #[error("This cell holds no conversation")]
   NotAConversation,
 }

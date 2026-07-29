@@ -4,6 +4,7 @@ pub mod membrane;
 use conversation_integrity::*;
 use errors::ConversationError;
 use hdk::prelude::*;
+use utils::errors::CommonError;
 
 // Signature matches the scaffolder's stub rather than the shared DNA's `init(_: ())`
 // (`dnas/requests_and_offers/zomes/coordinator/requests/src/lib.rs` line 9). The stub form
@@ -21,17 +22,14 @@ pub fn init() -> ExternResult<InitCallbackResult> {
 /// Read this clone's properties, refusing to operate in a cell that holds no conversation.
 ///
 /// `check_agent` in the integrity zome admits any agent, with no proof, to a cell whose
-/// properties are absent (`dnas/conversation/zomes/integrity/conversation/src/lib.rs`
-/// line 70). That escape is load-bearing rather than cosmetic: `strategy: clone_only`
-/// panics the conductor in 0.6.1, so a base conversation cell is provisioned on every
-/// install and has to pass genesis.
+/// properties are absent. That escape is load-bearing rather than cosmetic:
+/// `strategy: clone_only` panics the conductor in 0.6.1 and on upstream `main-0.6`, so a
+/// base conversation cell is provisioned on every install and has to pass genesis.
 ///
-/// The consequence is that the base cell is a live DHT with an open membrane. Every install
-/// derives it from the same `workdir/happ.yaml`, so they share a DNA hash and therefore a
-/// network. No conversation ever lives there, and nothing sensitive can leak from it, but
-/// without a guard it is a writable surface reachable by anyone driving the conductor API
-/// directly. Every extern in this zome starts here, which closes that surface and hands the
-/// caller the progenitor and conversation id it needed anyway.
+/// The consequence is that the base cell is a live DHT with an open membrane, shared by
+/// every install because they all derive it from the same `workdir/happ.yaml`. The integrity
+/// zome refuses writes there; this guard makes our own functions refuse earlier, with a
+/// readable error, and hands the caller the progenitor and conversation id it needed anyway.
 pub fn conversation_properties() -> ExternResult<Properties> {
   let info = dna_info()?;
 
@@ -40,7 +38,7 @@ pub fn conversation_properties() -> ExternResult<Properties> {
     return Err(ConversationError::NotAConversation.into());
   }
 
-  Properties::try_from(info.modifiers.properties).map_err(|e| ConversationError::Serialize(e).into())
+  Properties::try_from(info.modifiers.properties).map_err(|e| CommonError::Serialize(e).into())
 }
 
 // ============================================================================
@@ -52,10 +50,10 @@ pub fn conversation_properties() -> ExternResult<Properties> {
 /// service layer can reuse the same discriminated union.
 ///
 /// One variant is deliberately absent. `EntryDeleted` has no counterpart here because
-/// `reject_delete` in the integrity zome (line 304) makes a delete unvalidatable: the
-/// removal primitive in this design is leaving the clone, not deleting an entry. A delete
-/// could still be written to a local source chain and fail on publish, so emitting a signal
-/// for it would advertise a capability that does not exist. `Action::Delete` therefore falls
+/// `reject_delete` in the integrity zome makes a delete unvalidatable: the removal
+/// primitive in this design is leaving the clone, not deleting an entry. A delete could
+/// still be written to a local source chain and fail on publish, so emitting a signal for
+/// it would advertise a capability that does not exist. `Action::Delete` therefore falls
 /// through to the catch-all in `signal_action`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,7 +98,7 @@ fn signal_action(action: SignedActionHashed) -> ExternResult<()> {
     }
     Action::DeleteLink(delete_link) => {
       let record = get(delete_link.link_add_address.clone(), GetOptions::default())?.ok_or(
-        ConversationError::LinkNotFound("Failed to fetch CreateLink action".to_string()),
+        CommonError::LinkNotFound("Failed to fetch CreateLink action".to_string()),
       )?;
       match record.action() {
         Action::CreateLink(create_link) => {
@@ -111,7 +109,7 @@ fn signal_action(action: SignedActionHashed) -> ExternResult<()> {
           }
           Ok(())
         }
-        _ => Err(ConversationError::LinkNotFound("Create Link should exist".to_string()).into()),
+        _ => Err(CommonError::LinkNotFound("Create Link should exist".to_string()).into()),
       }
     }
     Action::Create(_create) => {
