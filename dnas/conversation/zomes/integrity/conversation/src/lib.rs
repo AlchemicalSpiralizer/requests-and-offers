@@ -16,25 +16,44 @@ use hdi::prelude::*;
 pub struct Properties {
   /// The conversation's creator. Issues every membrane proof for this clone.
   ///
-  /// KNOWN CONFLICT WITH THE DESIGN NOTE. Note section 10 says "a participant
-  /// may invite an administrator", either one of them. Only the progenitor can
-  /// sign a proof here, and the progenitor is whichever member responded to the
-  /// listing, so the other participant cannot invite anyone. Resolving that
-  /// means both peers' keys living in these properties and the envelope naming
-  /// its signer. Deliberately not done in this change: it rewrites
-  /// `issue_membrane_proof` and wants its own test against the membrane gate.
+  /// KNOWN CONFLICT, and a required fix rather than a tidy-up. Administrator
+  /// invitation is unilateral: either participant may invite, and the other is
+  /// told (see `SystemEvent`). Only the progenitor can sign a proof here, and the
+  /// progenitor is whichever member responded to the listing, so exactly one of
+  /// the two can invite and which one is an accident of who answered first.
+  ///
+  /// Resolving it means both peers' keys living in these properties and the
+  /// envelope naming its signer, with `check_agent` verifying the signature and
+  /// then checking the signer is one of the two. Properties are not an entry, so
+  /// note section 9's refusal of a participants field is untouched, and they are
+  /// unreadable without the DNA. Both peers must already supply identical
+  /// properties for their DNA hashes to converge, and the responder knows both
+  /// keys, so nothing new has to travel.
+  ///
+  /// Deliberately not done in this change: it rewrites `issue_membrane_proof` and
+  /// wants its own test against a membrane gate that has never been exercised.
   pub progenitor: AgentPubKey,
 
   /// Opaque random identifier for this conversation.
   ///
   /// DELIBERATE DIVERGENCE FROM VOLLA. Volla checks a proof against
   /// `modifiers.network_seed`, so for them the conversation id *is* the seed.
-  /// R&O cannot do that: a conversation identifier may be stored on a public
-  /// hREA agreement (note section 5), and the seed must stay secret because
-  /// kitsune2's space read route returns a space's agent list to any caller on
-  /// an unauthenticated bootstrap (note section 6). Volla has no shared member
-  /// directory to correlate an enumerated agent list against; R&O does, which is
-  /// exactly what makes enumeration a social graph leak here and not there.
+  /// R&O cannot do that. A conversation identifier may be stored on a public hREA
+  /// agreement (note section 5), and the seed must stay secret, because
+  /// kitsune2 0.4.1's space read route (`GET /bootstrap/{space}`) returns the
+  /// agent list for whatever space identifier the caller supplies, and with no
+  /// authentication hook configured the server issues bearer tokens freely and
+  /// treats every request as successful (note section 6). Volla has no shared
+  /// member directory to correlate an enumerated agent list against; R&O does,
+  /// which is what makes enumeration a social graph leak here and not there.
+  ///
+  /// The complementary constraint belongs with whoever writes clone creation,
+  /// which does not exist yet (note section 12, step 4): the network seed must be
+  /// random and transmitted, never derived from public values. A seed derived
+  /// from a listing hash and an agent key would be computable by every member,
+  /// handing over the conversation graph to anyone willing to enumerate. The
+  /// membrane would still keep them out of the clone, but membership enumeration
+  /// alone is the leak this design exists to prevent.
   pub conversation_id: String,
 }
 
@@ -64,9 +83,12 @@ pub fn is_conversation_cell() -> ExternResult<bool> {
 
 /// Naming follows Volla's `MembraneProofData` / `MembraneProofEnvelope` pair.
 ///
-/// Volla also carries an `as_role: u32`. Not adopted here: the design note does
-/// not specify roles, and administrator invitation (note section 10) is not yet
-/// designed. Adding a field we have not specified would be inventing.
+/// Volla also carries an `as_role: u32`. Not adopted here, but not for want of a
+/// design: note section 10 specifies administrator invitation in full and gives
+/// an invited administrator no distinct role. They are an ordinary agent inside
+/// the clone, admitted by the same kind of proof as a participant, and what
+/// marks the event is the committed `SystemEvent::AdminInvited` rather than
+/// anything carried in the proof. A role field would have nothing to say.
 #[derive(Serialize, Deserialize, Debug, SerializedBytes, Clone)]
 pub struct MembraneProofData {
   pub conversation_id: String,
@@ -161,8 +183,19 @@ pub enum ContextType {
 ///
 /// Keeping the event structured means the member-facing wording stays a UI
 /// string, so it can be revised or translated without every historical entry
-/// carrying the old text, and without a DNA change. The wording itself is a
-/// governance matter (note sections 10 and 11), not an architectural one.
+/// carrying the old text, and without a DNA change. The wording is a governance
+/// matter (note sections 10 and 11) and is not settled here.
+///
+/// WHAT IS SETTLED, superseding note section 10's open question. Invitation is
+/// unilateral with notice: either participant may invite an administrator and the
+/// other is told. Section 10 leaves "whether both participants must agree" open
+/// for governance, and mutual agreement fails on its own logic. The case the
+/// mechanism exists for is a participant behaving badly, and they will not agree
+/// to being observed, so a consent requirement disables the instrument precisely
+/// when it is needed. Notice costs the inviter nothing they can be harmed by:
+/// there are no deletes in this design and leaving removes only your own copy, so
+/// the history an administrator arrives to read is intact whatever the other
+/// party does on being told.
 ///
 /// `AdminInvited` names only the administrator. The inviting participant is the
 /// action's author and does not need recording twice.
@@ -182,6 +215,11 @@ pub enum MessageType {
 /// There is NO `participants` field. The note is explicit: participants are the
 /// clone's membrane, not a field on an entry. Recording them again would
 /// partially reintroduce the exposure isolation exists to remove.
+///
+/// There is also no `created_at`. Every action header already carries a
+/// timestamp, reachable as `record.action().timestamp()`. A consequence worth
+/// knowing: with no time field, this entry is addressed purely by its content,
+/// so committing the same configuration twice yields one entry rather than two.
 #[hdk_entry_helper]
 #[derive(Clone)]
 pub struct ConversationConfig {
@@ -194,16 +232,30 @@ pub struct ConversationConfig {
 
   /// Optional hREA proposal id, also resolved frontend-side.
   pub proposal_id: Option<String>,
-
-  pub created_at: Timestamp,
 }
 
+/// A message.
+///
+/// No `created_at`. The action header carries a timestamp already, and a
+/// client-supplied one would be both redundant and forgeable: a participant
+/// could date a message into the past and have every client render it earlier in
+/// the thread than it was sent. `record.action().timestamp()` is the committing
+/// conductor's claim rather than the sender's free choice, and time bucketing
+/// reads `sys_time()` on create and the action timestamp on update, so nothing
+/// needs the field.
 #[hdk_entry_helper]
 #[derive(Clone)]
 pub struct Message {
   /// Plaintext, and empty for system messages, whose payload is the event.
-  /// A clone contains exactly its participants, who hold the plaintext by
-  /// definition (note section 6).
+  ///
+  /// Note section 6 decides against encryption inside a clone: a clone contains
+  /// exactly its participants, who hold the plaintext by definition, so
+  /// encrypting content that only its intended readers can fetch buys key
+  /// management and a device-loss failure mode for very little. Volla, a
+  /// dedicated privacy messenger, reaches the same conclusion. Clone contents
+  /// therefore sit unencrypted in the conductor's local databases, and
+  /// device-level protection is the member's own disk encryption, which note
+  /// section 11 tells members plainly.
   pub content: String,
 
   /// Distinguishes member messages from system messages, of which the
@@ -211,7 +263,6 @@ pub struct Message {
   pub message_type: MessageType,
 
   pub reply_to: Option<ActionHash>,
-  pub created_at: Timestamp,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,7 +299,17 @@ pub enum LinkTypes {
 // ENTRY VALIDATION
 // ============================================================================
 
-const MAX_MESSAGE_BYTES: usize = 10_000;
+/// A product decision, pinned to one platform fact rather than a round number.
+///
+/// Nothing in the design note specifies a message size, and content here is
+/// plaintext, so no crypto ceiling constrains it today. But note section 6
+/// records that every zome crypto primitive routes through lair over IPC and
+/// rejects a single call above 8192 bytes, and it deliberately keeps two
+/// encryption routes open should they ever be wanted. A cap above that ceiling
+/// would quietly foreclose encrypting a maximally-sized message without
+/// chunking, which section 6 records as untested. Sitting at the ceiling costs
+/// nothing: 8192 bytes is roughly 1,300 words, which is long for a chat message.
+const MAX_MESSAGE_BYTES: usize = 8192;
 
 fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
   match &message.message_type {
@@ -278,24 +339,19 @@ fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
     }
   }
 
-  if message.created_at == Timestamp::ZERO {
-    return Ok(ValidateCallbackResult::Invalid(
-      "message created_at must be non-zero".to_string(),
-    ));
-  }
-
   Ok(ValidateCallbackResult::Valid)
 }
 
+/// Nothing to check yet, deliberately.
+///
+/// `context_type` is an enum and therefore type-checked by deserialisation.
+/// `context_hash` and `proposal_id` point into other cells and resolve
+/// frontend-side, so this DNA cannot verify either without a DHT read, which
+/// validation forbids. Kept as the named place for checks that do become
+/// possible rather than inlined into `validate_entry`.
 fn validate_conversation_config(
-  config: &ConversationConfig,
+  _config: &ConversationConfig,
 ) -> ExternResult<ValidateCallbackResult> {
-  if config.created_at == Timestamp::ZERO {
-    return Ok(ValidateCallbackResult::Invalid(
-      "conversation config created_at must be non-zero".to_string(),
-    ));
-  }
-
   Ok(ValidateCallbackResult::Valid)
 }
 
