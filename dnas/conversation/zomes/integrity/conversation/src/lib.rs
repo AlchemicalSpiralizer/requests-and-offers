@@ -15,6 +15,14 @@ use hdi::prelude::*;
 #[derive(Serialize, Deserialize, Debug, SerializedBytes, Clone)]
 pub struct Properties {
   /// The conversation's creator. Issues every membrane proof for this clone.
+  ///
+  /// KNOWN CONFLICT WITH THE DESIGN NOTE. Note section 10 says "a participant
+  /// may invite an administrator", either one of them. Only the progenitor can
+  /// sign a proof here, and the progenitor is whichever member responded to the
+  /// listing, so the other participant cannot invite anyone. Resolving that
+  /// means both peers' keys living in these properties and the envelope naming
+  /// its signer. Deliberately not done in this change: it rewrites
+  /// `issue_membrane_proof` and wants its own test against the membrane gate.
   pub progenitor: AgentPubKey,
 
   /// Opaque random identifier for this conversation.
@@ -28,6 +36,26 @@ pub struct Properties {
   /// directory to correlate an enumerated agent list against; R&O does, which is
   /// exactly what makes enumeration a social graph leak here and not there.
   pub conversation_id: String,
+}
+
+/// Does this cell hold a conversation, or is it the empty base cell?
+///
+/// One definition rather than a byte test repeated at each site.
+///
+/// A base conversation cell is provisioned on every install, because
+/// `strategy: clone_only` hits `unimplemented!()` in
+/// `holochain_conductor_api-0.6.1/src/app_interface.rs` at line 491 while
+/// building `AppInfo`, which the frontend calls constantly. That code is
+/// byte-identical on upstream `main-0.6`, so this affects the whole 0.6 line
+/// rather than our pin and is not a workaround waiting to be deleted.
+///
+/// `workdir/happ.yaml` gives the conversation role `properties: ~`, which
+/// encodes as msgpack nil, one byte. A clone receives real properties from the
+/// clone creation call.
+///
+/// `dna_info()` is deterministic and therefore permitted in validation.
+pub fn is_conversation_cell() -> ExternResult<bool> {
+  Ok(dna_info()?.modifiers.properties.bytes().len() != 1)
 }
 
 // ============================================================================
@@ -64,14 +92,14 @@ pub fn check_agent(
   agent_pub_key: AgentPubKey,
   membrane_proof: Option<MembraneProof>,
 ) -> ExternResult<ValidateCallbackResult> {
-  let info = dna_info()?;
-
-  // Dev mode: no properties supplied at all. Encoded msgpack nil is one byte.
-  if info.modifiers.properties.bytes().len() == 1 {
+  // The base cell has no membrane. It must be joinable or the app will not
+  // install at all. It is not writable: see `refuse_base_cell_write`.
+  if !is_conversation_cell()? {
     return Ok(ValidateCallbackResult::Valid);
   }
 
-  let props = Properties::try_from(info.modifiers.properties).map_err(|e| wasm_error!(e))?;
+  let props =
+    Properties::try_from(dna_info()?.modifiers.properties).map_err(|e| wasm_error!(e))?;
 
   // The creator is progenitor of their own clone and issues everyone else's
   // proof, so nobody has issued one to them.
@@ -122,10 +150,31 @@ pub enum ContextType {
   Direct,
 }
 
+/// A structured system event, committed rather than rendered.
+///
+/// Note section 10 requires the administrator-invitation announcement to be a
+/// committed entry rather than a client-side rendering, so a modified client
+/// cannot suppress it. It does not require the announcement's prose to be
+/// committed, and committing prose would buy nothing against that threat: a
+/// client willing to hide a committed event is equally willing to blank a
+/// committed string.
+///
+/// Keeping the event structured means the member-facing wording stays a UI
+/// string, so it can be revised or translated without every historical entry
+/// carrying the old text, and without a DNA change. The wording itself is a
+/// governance matter (note sections 10 and 11), not an architectural one.
+///
+/// `AdminInvited` names only the administrator. The inviting participant is the
+/// action's author and does not need recording twice.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SystemEvent {
+  AdminInvited { admin: AgentPubKey },
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum MessageType {
   Text,
-  System,
+  System(SystemEvent),
 }
 
 /// Conversation metadata.
@@ -152,8 +201,9 @@ pub struct ConversationConfig {
 #[hdk_entry_helper]
 #[derive(Clone)]
 pub struct Message {
-  /// Plaintext. A clone contains exactly its participants, who hold the
-  /// plaintext by definition (note section 6).
+  /// Plaintext, and empty for system messages, whose payload is the event.
+  /// A clone contains exactly its participants, who hold the plaintext by
+  /// definition (note section 6).
   pub content: String,
 
   /// Distinguishes member messages from system messages, of which the
@@ -201,17 +251,31 @@ pub enum LinkTypes {
 const MAX_MESSAGE_BYTES: usize = 10_000;
 
 fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
-  if message.content.trim().is_empty() {
-    return Ok(ValidateCallbackResult::Invalid(
-      "message content must not be empty".to_string(),
-    ));
-  }
+  match &message.message_type {
+    // The event is the payload. Committed prose would be untranslatable and
+    // unrevisable, and buys nothing (see `SystemEvent`).
+    MessageType::System(_) => {
+      if !message.content.is_empty() {
+        return Ok(ValidateCallbackResult::Invalid(
+          "a system message must carry no content; its event is the payload".to_string(),
+        ));
+      }
+    }
 
-  if message.content.len() > MAX_MESSAGE_BYTES {
-    return Ok(ValidateCallbackResult::Invalid(format!(
-      "message content exceeds {} bytes",
-      MAX_MESSAGE_BYTES
-    )));
+    MessageType::Text => {
+      if message.content.trim().is_empty() {
+        return Ok(ValidateCallbackResult::Invalid(
+          "message content must not be empty".to_string(),
+        ));
+      }
+
+      if message.content.len() > MAX_MESSAGE_BYTES {
+        return Ok(ValidateCallbackResult::Invalid(format!(
+          "message content exceeds {} bytes",
+          MAX_MESSAGE_BYTES
+        )));
+      }
+    }
   }
 
   if message.created_at == Timestamp::ZERO {
@@ -240,6 +304,25 @@ fn validate_entry(entry: &EntryTypes) -> ExternResult<ValidateCallbackResult> {
     EntryTypes::Message(message) => validate_message(message),
     EntryTypes::ConversationConfig(config) => validate_conversation_config(config),
   }
+}
+
+/// The base cell may be joined but never written to.
+///
+/// NOT IN THE DESIGN NOTE, and not a design choice so much as a consequence of
+/// one. Because a base cell is unavoidable (see `is_conversation_cell`) and its
+/// membrane admits anyone, and because every install derives it from the same
+/// `workdir/happ.yaml` and so shares its DNA hash, it is one open network that
+/// every R&O user joins. No conversation ever lives there and nothing sensitive
+/// can leak from it, but left writable it is a storage-abuse surface: entries
+/// pushed into it would be stored and gossiped by every user's node.
+///
+/// This has to sit in the integrity zome rather than the coordinator. A
+/// coordinator guard stops anyone calling our functions and stops nobody who
+/// compiles their own coordinator against this crate.
+fn refuse_base_cell_write() -> ExternResult<ValidateCallbackResult> {
+  Ok(ValidateCallbackResult::Invalid(
+    "the base conversation cell holds no conversation and accepts no writes".to_string(),
+  ))
 }
 
 /// NOT IN THE DESIGN NOTE, flagged for review.
@@ -338,15 +421,27 @@ pub fn validate_agent_joining(
 
 #[hdk_extern]
 pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
+  // Read once. Every app-entry and link arm below consults it; agent activity
+  // and chain-management records deliberately do not, because the base cell
+  // must remain joinable.
+  let in_conversation = is_conversation_cell()?;
+
   match op.flattened::<EntryTypes, LinkTypes>()? {
     FlatOp::StoreEntry(store_entry) => match store_entry {
-      OpEntry::CreateEntry { app_entry, .. } => validate_entry(&app_entry),
-      OpEntry::UpdateEntry { app_entry, .. } => validate_entry(&app_entry),
+      OpEntry::CreateEntry { app_entry, .. } | OpEntry::UpdateEntry { app_entry, .. } => {
+        if !in_conversation {
+          return refuse_base_cell_write();
+        }
+        validate_entry(&app_entry)
+      }
       _ => Ok(ValidateCallbackResult::Valid),
     },
 
     FlatOp::RegisterUpdate(update_entry) => match update_entry {
       OpUpdate::Entry { app_entry, action } => {
+        if !in_conversation {
+          return refuse_base_cell_write();
+        }
         match validate_update_author(action.original_action_address, &action.author)? {
           ValidateCallbackResult::Valid => validate_entry(&app_entry),
           other => Ok(other),
@@ -362,11 +457,16 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
       base_address,
       action,
       ..
-    } => match link_type {
-      LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
-      LinkTypes::PathToConfig => Ok(ValidateCallbackResult::Valid),
-      LinkTypes::MessageUpdates => validate_update_link_author(base_address, &action.author),
-    },
+    } => {
+      if !in_conversation {
+        return refuse_base_cell_write();
+      }
+      match link_type {
+        LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
+        LinkTypes::PathToConfig => Ok(ValidateCallbackResult::Valid),
+        LinkTypes::MessageUpdates => validate_update_link_author(base_address, &action.author),
+      }
+    }
 
     FlatOp::RegisterDeleteLink { link_type, .. } => match link_type {
       LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
@@ -375,8 +475,12 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
     },
 
     FlatOp::StoreRecord(store_record) => match store_record {
-      OpRecord::CreateEntry { app_entry, .. } => validate_entry(&app_entry),
-      OpRecord::UpdateEntry { app_entry, .. } => validate_entry(&app_entry),
+      OpRecord::CreateEntry { app_entry, .. } | OpRecord::UpdateEntry { app_entry, .. } => {
+        if !in_conversation {
+          return refuse_base_cell_write();
+        }
+        validate_entry(&app_entry)
+      }
       OpRecord::DeleteEntry { .. } => reject_delete(),
       _ => Ok(ValidateCallbackResult::Valid),
     },
