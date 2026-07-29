@@ -11,6 +11,7 @@ name = "conversation"
 hdk = { workspace = true }
 serde = { workspace = true }
 holochain_serialized_bytes = { workspace = true }
+thiserror = { workspace = true }
 
 conversation_integrity = { workspace = true }
 
@@ -20,4 +21,3 @@ tokio = { workspace = true }
 
 # Temporarily pinned, remove when upgrading to Holochain 0.7
 pkcs8 = "=0.11.0-rc.11"
-

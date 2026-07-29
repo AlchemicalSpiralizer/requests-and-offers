@@ -164,6 +164,8 @@ pub struct Message {
   pub created_at: Timestamp,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
 #[hdk_entry_types]
 #[unit_enum(UnitEntryTypes)]
 pub enum EntryTypes {
@@ -175,6 +177,7 @@ pub enum EntryTypes {
 // LINK TYPES
 // ============================================================================
 
+#[derive(Serialize, Deserialize)]
 #[hdk_link_types]
 pub enum LinkTypes {
   /// Conversation to messages, time-bucketed for pagination. Bucket width is
