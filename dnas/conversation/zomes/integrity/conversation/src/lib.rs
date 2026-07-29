@@ -264,6 +264,33 @@ fn validate_update_author(
   Ok(ValidateCallbackResult::Valid)
 }
 
+/// NOT IN THE DESIGN NOTE, flagged alongside `validate_update_author`.
+///
+/// The entry-level author check stops one participant authoring an update to
+/// another's message. Without this, they could instead link an entry they
+/// authored themselves from the other's message as its update, and a client
+/// walking the chain would render their text as the other's current message.
+/// The same forgery, one layer down.
+fn validate_update_link_author(
+  base_address: AnyLinkableHash,
+  linking_author: &AgentPubKey,
+) -> ExternResult<ValidateCallbackResult> {
+  let Some(base_action_hash) = base_address.into_action_hash() else {
+    return Ok(ValidateCallbackResult::Invalid(
+      "a MessageUpdates link must be based on an action hash".to_string(),
+    ));
+  };
+
+  let base = must_get_action(base_action_hash)?;
+
+  match base.action().author() == linking_author {
+    true => Ok(ValidateCallbackResult::Valid),
+    false => Ok(ValidateCallbackResult::Invalid(
+      "only the agent who authored a message may link an update to it".to_string(),
+    )),
+  }
+}
+
 /// Deletion is not an entry-level operation in this design.
 ///
 /// Note section 8: crypto-shredding is unavailable on this stack, so the
@@ -327,10 +354,15 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
 
     FlatOp::RegisterDelete(_) => reject_delete(),
 
-    FlatOp::RegisterCreateLink { link_type, .. } => match link_type {
+    FlatOp::RegisterCreateLink {
+      link_type,
+      base_address,
+      action,
+      ..
+    } => match link_type {
       LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
-      LinkTypes::MessageUpdates => Ok(ValidateCallbackResult::Valid),
       LinkTypes::PathToConfig => Ok(ValidateCallbackResult::Valid),
+      LinkTypes::MessageUpdates => validate_update_link_author(base_address, &action.author),
     },
 
     FlatOp::RegisterDeleteLink { link_type, .. } => match link_type {
