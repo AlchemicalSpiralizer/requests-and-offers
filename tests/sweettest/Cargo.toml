@@ -75,3 +75,7 @@ path = "tests/offers.rs"
 [[test]]
 name = "mediums_of_exchange"
 path = "tests/mediums_of_exchange.rs"
+
+[[test]]
+name = "conversation_membrane"
+path = "tests/conversation_membrane.rs"
