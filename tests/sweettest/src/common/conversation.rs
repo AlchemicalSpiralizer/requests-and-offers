@@ -36,6 +36,16 @@ pub const CONVERSATION_ROLE: &str = "conversation";
 pub struct ConversationProperties {
     pub peers: Vec<String>,
     pub conversation_id: String,
+
+    /// Base64 like `peers`, for the same reason: the conductor takes YAML and the zome
+    /// reads a typed `ActionHash` back. Proven for `AgentPubKey`; this exercises the same
+    /// `HoloHash` path with a different prefix.
+    pub context_hash: Option<String>,
+
+    /// `Request`, `Offer` or `Direct`, matching the zome's `ContextType` variant names.
+    pub context_type: String,
+
+    pub start_bucket: u32,
 }
 
 /// Mirror of `MembraneProofData`.
@@ -67,20 +77,55 @@ pub fn conversation_properties_unchecked(
     peers: &[AgentPubKey],
     conversation_id: &str,
 ) -> YamlProperties {
-    let props = ConversationProperties {
-        peers: peers.iter().map(|k| k.to_string()).collect(),
-        conversation_id: conversation_id.to_string(),
-    };
-
-    YamlProperties::new(serde_yaml::to_value(props).expect("properties should serialise to YAML"))
+    conversation_properties_full(peers, conversation_id, None, "Direct", 0)
 }
 
 /// Build conversation properties for a peer set, sorted as the zome requires.
+///
+/// Defaults to a Direct conversation with no context hash, which satisfies the zome's
+/// `Direct` implies no-context invariant, and to bucket zero, which no message can precede.
 pub fn conversation_properties(
     peers: &[AgentPubKey],
     conversation_id: &str,
 ) -> YamlProperties {
     conversation_properties_unchecked(&ordered_peers(peers), conversation_id)
+}
+
+/// Build properties for a conversation about a listing. Sorts the peer set.
+pub fn conversation_properties_with_context(
+    peers: &[AgentPubKey],
+    conversation_id: &str,
+    context_hash: &ActionHash,
+    context_type: &str,
+    start_bucket: u32,
+) -> YamlProperties {
+    conversation_properties_full(
+        &ordered_peers(peers),
+        conversation_id,
+        Some(context_hash.to_string()),
+        context_type,
+        start_bucket,
+    )
+}
+
+/// Every field explicit, including combinations the zome refuses. Peers are taken exactly
+/// as given so the ordering guard stays testable.
+pub fn conversation_properties_full(
+    peers: &[AgentPubKey],
+    conversation_id: &str,
+    context_hash: Option<String>,
+    context_type: &str,
+    start_bucket: u32,
+) -> YamlProperties {
+    let props = ConversationProperties {
+        peers: peers.iter().map(|k| k.to_string()).collect(),
+        conversation_id: conversation_id.to_string(),
+        context_hash,
+        context_type: context_type.to_string(),
+        start_bucket,
+    };
+
+    YamlProperties::new(serde_yaml::to_value(props).expect("properties should serialise to YAML"))
 }
 
 /// Install the hApp on `conductor`, provisioning the conversation role with the given

@@ -22,6 +22,25 @@ pub struct Properties {
   /// when no authentication hook is configured (note section 6). The seed must also be
   /// random and transmitted, never derived from public values.
   pub conversation_id: String,
+
+  /// The listing this conversation concerns, or `None` for a direct conversation. Points
+  /// into the shared DNA and is resolved frontend-side, as hREA proposals already are.
+  ///
+  /// In properties rather than on an entry (note section 9): creation-time context that
+  /// never changes, already travelling with the invitation, and readable with no DHT read.
+  /// Properties being immutable also means a conversation cannot be re-pointed at another
+  /// listing.
+  pub context_hash: Option<ActionHash>,
+
+  pub context_type: ContextType,
+
+  /// The bucket the conversation opened in, giving a joining agent a floor to walk forward
+  /// from. A fresh joiner, in particular an invited administrator reading the whole history
+  /// (note section 10), holds no message to walk backward from and would otherwise have no
+  /// way to find where the conversation starts. `validate_message` refuses any message below
+  /// it, so declaring a late start cannot hide earlier messages: they become uncommittable
+  /// rather than merely hard to find.
+  pub start_bucket: u32,
 }
 
 /// False for the empty base cell, which carries no properties.
@@ -74,6 +93,16 @@ pub fn check_agent(
   if props.peers.len() < 2 || !props.peers.windows(2).all(|w| w[0] < w[1]) {
     return Ok(ValidateCallbackResult::Invalid(
       "conversation properties must carry at least two peers, ascending and distinct".to_string(),
+    ));
+  }
+
+  // A Direct conversation concerns no listing; every other kind concerns exactly one.
+  // Properties feed the DNA hash, so this cannot be corrected later. Refuse at genesis
+  // rather than admit a clone whose context is uninterpretable.
+  if (props.context_type == ContextType::Direct) != props.context_hash.is_none() {
+    return Ok(ValidateCallbackResult::Invalid(
+      "a Direct conversation must carry no context hash, and any other kind must carry one"
+        .to_string(),
     ));
   }
 
@@ -140,27 +169,18 @@ pub enum ContextType {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum SystemEvent {
   AdminInvited { admin: AgentPubKey },
+
+  /// The hREA proposal id, announced when a conversation reaches an agreement. This is not
+  /// creation-time context and so cannot live in properties: a conversation produces its
+  /// agreement mid-life (note section 5). Announced in the stream at the moment the deal was
+  /// struck, and resolved frontend-side like `context_hash`.
+  AgreementReached { proposal_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum MessageType {
   Text,
   System(SystemEvent),
-}
-
-/// No `participants` field: participants are the clone's membrane, not entry data (note
-/// section 9). No `created_at`, so this entry is addressed purely by its content and
-/// committing the same configuration twice yields one entry rather than two.
-#[hdk_entry_helper]
-#[derive(Clone)]
-pub struct ConversationConfig {
-  /// Points into the shared DNA. Resolved frontend-side, as hREA proposals already are.
-  pub context_hash: Option<ActionHash>,
-
-  pub context_type: ContextType,
-
-  /// Also resolved frontend-side.
-  pub proposal_id: Option<String>,
 }
 
 /// No `created_at`. The action header carries a timestamp, and a client-supplied one would
@@ -174,6 +194,17 @@ pub struct Message {
 
   pub message_type: MessageType,
   pub reply_to: Option<ActionHash>,
+
+  /// The window this message belongs to, and the link base pagination walks.
+  ///
+  /// A field rather than a value derived at read time, because a link needs its base when
+  /// the message is committed. This is not the `created_at` case: that field was redundant
+  /// beside the action timestamp and bought nothing, whereas the bucket decides whether a
+  /// message is found at all. `validate_message` checks it against the action's own
+  /// timestamp, so a client cannot file a message into a window the other participant will
+  /// not fetch. Volla carries the same field and validates nothing
+  /// (`dnas/relay/zomes/integrity/relay/src/message.rs` line 22).
+  pub bucket: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -181,7 +212,6 @@ pub struct Message {
 #[hdk_entry_types]
 #[unit_enum(UnitEntryTypes)]
 pub enum EntryTypes {
-  ConversationConfig(ConversationConfig),
   Message(Message),
 }
 
@@ -192,18 +222,60 @@ pub enum LinkTypes {
   PathToMessage,
 
   MessageUpdates,
-
-  /// NOT IN THE DESIGN NOTE. The note does not say how the configuration entry is
-  /// discovered, and an entry nothing links to is unreachable. Reconcile against the note.
-  PathToConfig,
 }
 
-/// Pinned to the lair IPC ceiling rather than a round number. Note section 6 records that
-/// every zome crypto primitive rejects a single call above 8192 bytes and keeps two
-/// encryption routes open, so a higher cap would foreclose encrypting one message unchunked.
-const MAX_MESSAGE_BYTES: usize = 8192;
+/// Chosen for text rather than inherited from a crypto limit. The platform ceiling is
+/// `ENTRY_SIZE_LIMIT`, 4,000,000 bytes (`holochain_integrity_types-0.6.1/src/entry.rs` line
+/// 30, enforced at `app_entry_bytes.rs` line 50), and every transport above it is far
+/// higher: 64 MB per app-websocket message, 100 MB per iroh frame by default. 64 KB is past
+/// any real chat message while still bounding the storage-abuse surface, since anything
+/// committed here is stored and gossiped by every participant. Attachments are chunked
+/// entries and are not governed by this.
+///
+/// The previous 8192 came from lair's IPC ceiling, which bounds an encryption call, not an
+/// entry. Content inside a clone is not encrypted (note section 6), and the hybrid route
+/// wraps only a 32-byte key, so that ceiling never bound a message.
+const MAX_MESSAGE_BYTES: usize = 65_536;
 
-fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
+/// Thirty days in microseconds. Fixed windows rather than calendar months: integer
+/// arithmetic only, no variable month length and no timezone, so the coordinator and this
+/// validator cannot disagree about where a boundary falls. Wide enough that a sparse
+/// conversation is a short walk back for a client fetching several buckets at a time.
+/// Hotspotting is not a concern here because a clone holds one two-party conversation, not
+/// every conversation in a network.
+const BUCKET_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+/// One definition, used by both the coordinator and validation below, so the two cannot
+/// drift. Volla places the equivalent helper in its integrity crate
+/// (`dnas/relay/zomes/integrity/relay/src/lib.rs` line 11).
+///
+/// Negative timestamps clamp to bucket zero rather than wrapping through the `as u32` cast.
+pub fn bucket_from_timestamp(timestamp: Timestamp) -> u32 {
+  (timestamp.as_micros().max(0) / BUCKET_MICROS) as u32
+}
+
+fn validate_message(
+  message: &Message,
+  timestamp: Timestamp,
+  start_bucket: u32,
+) -> ExternResult<ValidateCallbackResult> {
+  // The action's timestamp is fixed in the action itself, so author and validator read the
+  // same value and exact equality is correct. There is no second clock to tolerate.
+  let expected = bucket_from_timestamp(timestamp);
+  if message.bucket != expected {
+    return Ok(ValidateCallbackResult::Invalid(format!(
+      "message bucket {} does not match its action timestamp, which falls in bucket {}",
+      message.bucket, expected
+    )));
+  }
+
+  if message.bucket < start_bucket {
+    return Ok(ValidateCallbackResult::Invalid(format!(
+      "message bucket {} precedes the conversation start bucket {}",
+      message.bucket, start_bucket
+    )));
+  }
+
   match &message.message_type {
     // The event is the payload.
     MessageType::System(_) => {
@@ -234,18 +306,17 @@ fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
   Ok(ValidateCallbackResult::Valid)
 }
 
-/// Nothing checkable yet: `context_type` is type-checked by deserialisation, and the two
-/// identifiers resolve in other cells, which validation cannot read.
-fn validate_conversation_config(
-  _config: &ConversationConfig,
+/// `start_bucket` comes from properties, which are deterministic, so reading them here is
+/// permitted in validation.
+fn validate_entry(
+  entry: &EntryTypes,
+  timestamp: Timestamp,
 ) -> ExternResult<ValidateCallbackResult> {
-  Ok(ValidateCallbackResult::Valid)
-}
+  let props =
+    Properties::try_from(dna_info()?.modifiers.properties).map_err(|e| wasm_error!(e))?;
 
-fn validate_entry(entry: &EntryTypes) -> ExternResult<ValidateCallbackResult> {
   match entry {
-    EntryTypes::Message(message) => validate_message(message),
-    EntryTypes::ConversationConfig(config) => validate_conversation_config(config),
+    EntryTypes::Message(message) => validate_message(message, timestamp, props.start_bucket),
   }
 }
 
@@ -335,12 +406,22 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
   let in_conversation = is_conversation_cell()?;
 
   match op.flattened::<EntryTypes, LinkTypes>()? {
+    // Create and Update carry different action types, so the arms cannot be combined once
+    // the timestamp is needed.
     FlatOp::StoreEntry(store_entry) => match store_entry {
-      OpEntry::CreateEntry { app_entry, .. } | OpEntry::UpdateEntry { app_entry, .. } => {
+      OpEntry::CreateEntry { app_entry, action } => {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry)
+        validate_entry(&app_entry, action.timestamp)
+      }
+      OpEntry::UpdateEntry {
+        app_entry, action, ..
+      } => {
+        if !in_conversation {
+          return refuse_base_cell_write();
+        }
+        validate_entry(&app_entry, action.timestamp)
       }
       _ => Ok(ValidateCallbackResult::Valid),
     },
@@ -350,8 +431,9 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         if !in_conversation {
           return refuse_base_cell_write();
         }
+        let timestamp = action.timestamp;
         match validate_update_author(action.original_action_address, &action.author)? {
-          ValidateCallbackResult::Valid => validate_entry(&app_entry),
+          ValidateCallbackResult::Valid => validate_entry(&app_entry, timestamp),
           other => Ok(other),
         }
       }
@@ -371,7 +453,6 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
       }
       match link_type {
         LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
-        LinkTypes::PathToConfig => Ok(ValidateCallbackResult::Valid),
         LinkTypes::MessageUpdates => validate_update_link_author(base_address, &action.author),
       }
     }
@@ -379,15 +460,22 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
     FlatOp::RegisterDeleteLink { link_type, .. } => match link_type {
       LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
       LinkTypes::MessageUpdates => Ok(ValidateCallbackResult::Valid),
-      LinkTypes::PathToConfig => Ok(ValidateCallbackResult::Valid),
     },
 
     FlatOp::StoreRecord(store_record) => match store_record {
-      OpRecord::CreateEntry { app_entry, .. } | OpRecord::UpdateEntry { app_entry, .. } => {
+      OpRecord::CreateEntry { app_entry, action } => {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry)
+        validate_entry(&app_entry, action.timestamp)
+      }
+      OpRecord::UpdateEntry {
+        app_entry, action, ..
+      } => {
+        if !in_conversation {
+          return refuse_base_cell_write();
+        }
+        validate_entry(&app_entry, action.timestamp)
       }
       OpRecord::DeleteEntry { .. } => reject_delete(),
       _ => Ok(ValidateCallbackResult::Valid),
