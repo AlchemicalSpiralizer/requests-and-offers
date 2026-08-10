@@ -61,20 +61,26 @@ pub fn ordered_peers(keys: &[AgentPubKey]) -> Vec<AgentPubKey> {
     out
 }
 
-/// Build conversation properties for a peer set.
-pub fn conversation_properties(
+/// Build conversation properties from the peer list exactly as given, including an
+/// order the integrity zome will refuse. For tests that exercise the ordering guard.
+pub fn conversation_properties_unchecked(
     peers: &[AgentPubKey],
     conversation_id: &str,
 ) -> YamlProperties {
     let props = ConversationProperties {
-        peers: ordered_peers(peers)
-            .iter()
-            .map(|k| k.to_string())
-            .collect(),
+        peers: peers.iter().map(|k| k.to_string()).collect(),
         conversation_id: conversation_id.to_string(),
     };
 
     YamlProperties::new(serde_yaml::to_value(props).expect("properties should serialise to YAML"))
+}
+
+/// Build conversation properties for a peer set, sorted as the zome requires.
+pub fn conversation_properties(
+    peers: &[AgentPubKey],
+    conversation_id: &str,
+) -> YamlProperties {
+    conversation_properties_unchecked(&ordered_peers(peers), conversation_id)
 }
 
 /// Install the hApp on `conductor`, provisioning the conversation role with the given
@@ -108,6 +114,23 @@ pub async fn install_with_conversation(
             ignore_genesis_failure: true,
         })
         .await
+}
+
+/// Assert an install was refused, and refused for the expected reason.
+///
+/// Validation messages reach the caller intact inside
+/// `GenesisFailed -> WorkflowError -> GenesisFailure`, so a substring match is enough.
+pub fn assert_refused<T>(result: ConductorResult<T>, expected: &str) {
+    match result {
+        Ok(_) => panic!("expected genesis to be refused, but the install succeeded"),
+        Err(err) => {
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(expected),
+                "refused, but not for the expected reason.\n  expected: {expected}\n  actual: {text}"
+            );
+        }
+    }
 }
 
 /// Sign a membrane proof admitting `for_agent`, as `issue_membrane_proof` does.
