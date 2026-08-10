@@ -245,6 +245,15 @@ const MAX_MESSAGE_BYTES: usize = 65_536;
 /// every conversation in a network.
 const BUCKET_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
+/// The anchor a bucket's messages are linked from. Volla's shape
+/// (`dnas/relay/zomes/integrity/relay/src/lib.rs` line 11), and in the integrity crate for
+/// the same reason: the coordinator and `validate_message_link` must derive one base.
+const MESSAGES_PATH_PREFIX: &str = "messages";
+
+pub fn messages_path(bucket: u32) -> Path {
+  Path::from(format!("{}.{}", MESSAGES_PATH_PREFIX, bucket))
+}
+
 /// One definition, used by both the coordinator and validation below, so the two cannot
 /// drift. Volla places the equivalent helper in its integrity crate
 /// (`dnas/relay/zomes/integrity/relay/src/lib.rs` line 11).
@@ -352,6 +361,65 @@ fn validate_update_author(
   Ok(ValidateCallbackResult::Valid)
 }
 
+/// NOT IN THE DESIGN NOTE. A message's link base is fully derivable from its own validated
+/// bucket, so a base that disagrees carries no information and can only mislead. Left
+/// unchecked, a participant could commit correctly bucketed messages and file the links under
+/// a bucket nobody walks: an administrator invited to read the whole history (note section 10)
+/// would then find the other participant's messages and not theirs. That is selective
+/// suppression in exactly the case the invitation exists for.
+///
+/// `must_get_valid_record` on a hash the link already names is deterministic, so it is
+/// permitted here.
+fn validate_message_link(
+  base_address: AnyLinkableHash,
+  target_address: AnyLinkableHash,
+) -> ExternResult<ValidateCallbackResult> {
+  let Some(target_action_hash) = target_address.into_action_hash() else {
+    return Ok(ValidateCallbackResult::Invalid(
+      "a PathToMessage link must target an action hash".to_string(),
+    ));
+  };
+
+  let record = must_get_valid_record(target_action_hash)?;
+
+  let Some(entry) = record.entry().as_option() else {
+    return Ok(ValidateCallbackResult::Invalid(
+      "a PathToMessage link must target a message entry".to_string(),
+    ));
+  };
+
+  // `hdk_entry_helper` already yields a `WasmError` here, unlike the `SerializedBytes`
+  // conversions elsewhere in this file, so it needs no wrapping.
+  let message = Message::try_from(entry)?;
+  let expected: AnyLinkableHash = messages_path(message.bucket).path_entry_hash()?.into();
+
+  if base_address != expected {
+    return Ok(ValidateCallbackResult::Invalid(format!(
+      "a message in bucket {} must be linked from that bucket's path",
+      message.bucket
+    )));
+  }
+
+  Ok(ValidateCallbackResult::Valid)
+}
+
+/// NOT IN THE DESIGN NOTE. Holochain does not require the author of a delete-link action to
+/// be the author of the link it deletes. Without this check either participant could remove
+/// the other's message links, emptying the thread's index for everyone who reads it,
+/// including an invited administrator. Suppressing the other party's messages rather than
+/// merely hiding one's own, so this matters more than the misfiling above.
+fn validate_delete_link_author(
+  original_action: &CreateLink,
+  deleting_author: &AgentPubKey,
+) -> ExternResult<ValidateCallbackResult> {
+  match &original_action.author == deleting_author {
+    true => Ok(ValidateCallbackResult::Valid),
+    false => Ok(ValidateCallbackResult::Invalid(
+      "only the agent who created a link may delete it".to_string(),
+    )),
+  }
+}
+
 /// NOT IN THE DESIGN NOTE. The same forgery one layer down: linking an entry you authored
 /// yourself from the other participant's message as its update.
 fn validate_update_link_author(
@@ -445,6 +513,7 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
     FlatOp::RegisterCreateLink {
       link_type,
       base_address,
+      target_address,
       action,
       ..
     } => {
@@ -452,15 +521,21 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         return refuse_base_cell_write();
       }
       match link_type {
-        LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
+        LinkTypes::PathToMessage => validate_message_link(base_address, target_address),
         LinkTypes::MessageUpdates => validate_update_link_author(base_address, &action.author),
       }
     }
 
-    FlatOp::RegisterDeleteLink { link_type, .. } => match link_type {
-      LinkTypes::PathToMessage => Ok(ValidateCallbackResult::Valid),
-      LinkTypes::MessageUpdates => Ok(ValidateCallbackResult::Valid),
-    },
+    FlatOp::RegisterDeleteLink {
+      original_action,
+      action,
+      ..
+    } => {
+      if !in_conversation {
+        return refuse_base_cell_write();
+      }
+      validate_delete_link_author(&original_action, &action.author)
+    }
 
     FlatOp::StoreRecord(store_record) => match store_record {
       OpRecord::CreateEntry { app_entry, action } => {
