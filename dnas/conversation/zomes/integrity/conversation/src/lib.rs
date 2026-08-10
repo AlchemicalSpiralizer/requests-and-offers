@@ -5,13 +5,16 @@ use hdi::prelude::*;
 /// creation call at runtime rather than from YAML.
 #[derive(Serialize, Deserialize, Debug, SerializedBytes, Clone)]
 pub struct Properties {
-  /// Signs every membrane proof for this clone.
+  /// Every participant in this conversation, ascending by key bytes.
   ///
-  /// LIVE CONFLICT (#91). Invitation is unilateral, so either participant may invite an
-  /// administrator, but only the progenitor can sign and the progenitor is whichever member
-  /// answered the listing. The fix is both peers' keys here plus a signer field on the
-  /// envelope, with a canonical ordering rule so both sides derive the same DNA hash.
-  pub progenitor: AgentPubKey,
+  /// Properties feed the DNA hash, so an unordered pair would let two participants derive
+  /// two different hashes from the same conversation and land in separate networks with no
+  /// error anywhere. `check_agent` enforces the ordering rather than trusting it.
+  ///
+  /// Both hold the same authority: either may admit an administrator. This is what makes
+  /// unilateral invitation possible for both participants rather than only the one who
+  /// answered the listing.
+  pub peers: Vec<AgentPubKey>,
 
   /// Opaque random identifier, deliberately NOT the network seed as it is in Volla. A
   /// conversation id may reach a public hREA agreement, and the seed must stay secret:
@@ -37,6 +40,10 @@ pub fn is_conversation_cell() -> ExternResult<bool> {
 pub struct MembraneProofData {
   pub conversation_id: String,
   pub for_agent: AgentPubKey,
+
+  /// Inside the signed data, not on the envelope: the signature covers the claim of who
+  /// issued it, so the signer field cannot be swapped for another peer's after signing.
+  pub signer: AgentPubKey,
 }
 
 #[derive(Serialize, Deserialize, Debug, SerializedBytes)]
@@ -62,8 +69,16 @@ pub fn check_agent(
   let props =
     Properties::try_from(dna_info()?.modifiers.properties).map_err(|e| wasm_error!(e))?;
 
-  // Nobody issues the progenitor a proof for their own clone.
-  if agent_pub_key == props.progenitor {
+  // `windows(2)` with strict `<` rejects an unordered pair and a duplicated key together.
+  // Not `is_sorted`, whose stabilisation varies by toolchain.
+  if props.peers.len() < 2 || !props.peers.windows(2).all(|w| w[0] < w[1]) {
+    return Ok(ValidateCallbackResult::Invalid(
+      "conversation properties must carry at least two peers, ascending and distinct".to_string(),
+    ));
+  }
+
+  // Participants are admitted by identity; nobody issues them a proof for their own clone.
+  if props.peers.contains(&agent_pub_key) {
     return Ok(ValidateCallbackResult::Valid);
   }
 
@@ -87,7 +102,17 @@ pub fn check_agent(
         ));
       }
 
-      if verify_signature(props.progenitor, envelope.signature, envelope.data)? {
+      if !props.peers.contains(&envelope.data.signer) {
+        return Ok(ValidateCallbackResult::Invalid(
+          "membrane proof was not signed by a participant in this conversation".to_string(),
+        ));
+      }
+
+      if verify_signature(
+        envelope.data.signer.clone(),
+        envelope.signature,
+        envelope.data,
+      )? {
         return Ok(ValidateCallbackResult::Valid);
       }
 
@@ -196,6 +221,7 @@ fn validate_message(message: &Message) -> ExternResult<ValidateCallbackResult> {
         ));
       }
 
+      // `String::len` is bytes, not chars, which is what the ceiling is measured in.
       if message.content.len() > MAX_MESSAGE_BYTES {
         return Ok(ValidateCallbackResult::Invalid(format!(
           "message content exceeds {} bytes",

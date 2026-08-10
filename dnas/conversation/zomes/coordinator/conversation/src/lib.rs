@@ -6,10 +6,6 @@ use errors::ConversationError;
 use hdk::prelude::*;
 use utils::errors::CommonError;
 
-// Signature matches the scaffolder's stub rather than the shared DNA's `init(_: ())`
-// (`dnas/requests_and_offers/zomes/coordinator/requests/src/lib.rs` line 9). The stub form
-// is what packed successfully into `conversation.dna`, so it is the form known to compile
-// at this HDK pin.
 #[hdk_extern]
 pub fn init() -> ExternResult<InitCallbackResult> {
   Ok(InitCallbackResult::Pass)
@@ -29,7 +25,7 @@ pub fn init() -> ExternResult<InitCallbackResult> {
 /// The consequence is that the base cell is a live DHT with an open membrane, shared by
 /// every install because they all derive it from the same `workdir/happ.yaml`. The integrity
 /// zome refuses writes there; this guard makes our own functions refuse earlier, with a
-/// readable error, and hands the caller the progenitor and conversation id it needed anyway.
+/// readable error, and hands the caller the peer set and conversation id it needed anyway.
 pub fn conversation_properties() -> ExternResult<Properties> {
   let info = dna_info()?;
 
