@@ -245,6 +245,15 @@ const MAX_MESSAGE_BYTES: usize = 65_536;
 /// every conversation in a network.
 const BUCKET_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 
+/// How long a message stays editable, measured from when it was first sent.
+///
+/// Deliberately a separate constant from `BUCKET_MICROS` even though both are thirty days
+/// today. The bucket width is an indexing choice and this is a policy about correcting the
+/// record; they coincide by accident, and tying one to the other would make changing either
+/// silently change the other. Nothing about the edit rule refers to a bucket boundary, so a
+/// message sent late in a window keeps its full window.
+const EDIT_WINDOW_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
 /// The anchor a bucket's messages are linked from. Volla's shape
 /// (`dnas/relay/zomes/integrity/relay/src/lib.rs` line 11), and in the integrity crate for
 /// the same reason: the coordinator and `validate_message_link` must derive one base.
@@ -263,17 +272,64 @@ pub fn bucket_from_timestamp(timestamp: Timestamp) -> u32 {
   (timestamp.as_micros().max(0) / BUCKET_MICROS) as u32
 }
 
+/// A message is either being created or edited, and the two are bucketed against different
+/// timestamps: a create against its own, an edit against the message's first one, so that
+/// editing never moves a message in the thread.
+enum MessageTiming {
+  Created(Timestamp),
+  Updated { original: Timestamp, updated: Timestamp },
+}
+
+/// Walk an update chain back to the create that started it.
+///
+/// Each `Update` names the action it replaced, so following `original_action_address` reaches
+/// the create in as many steps as there are revisions, each one a deterministic
+/// `must_get_action`. Walking to the root rather than stopping at the previous revision is the
+/// point: a window measured from the previous revision would let a chain of edits carry
+/// editability forward indefinitely, thirty days at a time.
+fn root_create_timestamp(action_hash: ActionHash) -> ExternResult<Option<Timestamp>> {
+  let mut hash = action_hash;
+
+  loop {
+    let action = must_get_action(hash)?;
+
+    match action.action() {
+      Action::Create(create) => return Ok(Some(create.timestamp)),
+      Action::Update(update) => hash = update.original_action_address.clone(),
+      _ => return Ok(None),
+    }
+  }
+}
+
 fn validate_message(
   message: &Message,
-  timestamp: Timestamp,
+  timing: MessageTiming,
   start_bucket: u32,
 ) -> ExternResult<ValidateCallbackResult> {
-  // The action's timestamp is fixed in the action itself, so author and validator read the
-  // same value and exact equality is correct. There is no second clock to tolerate.
-  let expected = bucket_from_timestamp(timestamp);
+  // Timestamps are fixed in their actions, so author and validator read the same values and
+  // exact equality is correct. There is no second clock to tolerate.
+  let bucketed_against = match timing {
+    MessageTiming::Created(created) => created,
+    MessageTiming::Updated { original, updated } => {
+      let elapsed = updated.as_micros() - original.as_micros();
+
+      // A negative elapsed time means the edit claims to precede the message it edits, which
+      // is never legitimate.
+      if !(0..=EDIT_WINDOW_MICROS).contains(&elapsed) {
+        return Ok(ValidateCallbackResult::Invalid(format!(
+          "a message may be edited for {} days after it was sent",
+          EDIT_WINDOW_MICROS / (24 * 60 * 60 * 1_000_000)
+        )));
+      }
+
+      original
+    }
+  };
+
+  let expected = bucket_from_timestamp(bucketed_against);
   if message.bucket != expected {
     return Ok(ValidateCallbackResult::Invalid(format!(
-      "message bucket {} does not match its action timestamp, which falls in bucket {}",
+      "message bucket {} does not match the bucket its timestamp falls in, {}",
       message.bucket, expected
     )));
   }
@@ -319,13 +375,28 @@ fn validate_message(
 /// permitted in validation.
 fn validate_entry(
   entry: &EntryTypes,
-  timestamp: Timestamp,
+  timing: MessageTiming,
 ) -> ExternResult<ValidateCallbackResult> {
   let props =
     Properties::try_from(dna_info()?.modifiers.properties).map_err(|e| wasm_error!(e))?;
 
   match entry {
-    EntryTypes::Message(message) => validate_message(message, timestamp, props.start_bucket),
+    EntryTypes::Message(message) => validate_message(message, timing, props.start_bucket),
+  }
+}
+
+/// Shared by the three op arms that see an update, so the root walk and its failure case are
+/// written once.
+fn validate_updated_entry(
+  entry: &EntryTypes,
+  original_action_address: ActionHash,
+  updated: Timestamp,
+) -> ExternResult<ValidateCallbackResult> {
+  match root_create_timestamp(original_action_address)? {
+    Some(original) => validate_entry(entry, MessageTiming::Updated { original, updated }),
+    None => Ok(ValidateCallbackResult::Invalid(
+      "an update must replace a create or another update".to_string(),
+    )),
   }
 }
 
@@ -481,7 +552,7 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry, action.timestamp)
+        validate_entry(&app_entry, MessageTiming::Created(action.timestamp))
       }
       OpEntry::UpdateEntry {
         app_entry, action, ..
@@ -489,7 +560,7 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry, action.timestamp)
+        validate_updated_entry(&app_entry, action.original_action_address, action.timestamp)
       }
       _ => Ok(ValidateCallbackResult::Valid),
     },
@@ -500,8 +571,11 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
           return refuse_base_cell_write();
         }
         let timestamp = action.timestamp;
+        let original_action_address = action.original_action_address.clone();
         match validate_update_author(action.original_action_address, &action.author)? {
-          ValidateCallbackResult::Valid => validate_entry(&app_entry, timestamp),
+          ValidateCallbackResult::Valid => {
+            validate_updated_entry(&app_entry, original_action_address, timestamp)
+          }
           other => Ok(other),
         }
       }
@@ -542,7 +616,7 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry, action.timestamp)
+        validate_entry(&app_entry, MessageTiming::Created(action.timestamp))
       }
       OpRecord::UpdateEntry {
         app_entry, action, ..
@@ -550,7 +624,7 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
         if !in_conversation {
           return refuse_base_cell_write();
         }
-        validate_entry(&app_entry, action.timestamp)
+        validate_updated_entry(&app_entry, action.original_action_address, action.timestamp)
       }
       OpRecord::DeleteEntry { .. } => reject_delete(),
       _ => Ok(ValidateCallbackResult::Valid),
