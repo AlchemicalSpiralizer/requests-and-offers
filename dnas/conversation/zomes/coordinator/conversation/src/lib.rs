@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod membrane;
+pub mod messages;
 
 use conversation_integrity::*;
 use errors::ConversationError;

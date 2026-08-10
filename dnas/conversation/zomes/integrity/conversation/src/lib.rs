@@ -252,7 +252,17 @@ const BUCKET_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 /// record; they coincide by accident, and tying one to the other would make changing either
 /// silently change the other. Nothing about the edit rule refers to a bucket boundary, so a
 /// message sent late in a window keeps its full window.
-const EDIT_WINDOW_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+pub const EDIT_WINDOW_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+/// One definition of the window, called by validation below and by the coordinator's early
+/// refusal, so the rule cannot be expressed twice and drift.
+///
+/// A negative elapsed time means the edit claims to precede the message it edits, which is
+/// never legitimate, so it fails here rather than being treated as zero.
+pub fn within_edit_window(original: Timestamp, updated: Timestamp) -> bool {
+  let elapsed = updated.as_micros() - original.as_micros();
+  (0..=EDIT_WINDOW_MICROS).contains(&elapsed)
+}
 
 /// The anchor a bucket's messages are linked from. Volla's shape
 /// (`dnas/relay/zomes/integrity/relay/src/lib.rs` line 11), and in the integrity crate for
@@ -311,11 +321,7 @@ fn validate_message(
   let bucketed_against = match timing {
     MessageTiming::Created(created) => created,
     MessageTiming::Updated { original, updated } => {
-      let elapsed = updated.as_micros() - original.as_micros();
-
-      // A negative elapsed time means the edit claims to precede the message it edits, which
-      // is never legitimate.
-      if !(0..=EDIT_WINDOW_MICROS).contains(&elapsed) {
+      if !within_edit_window(original, updated) {
         return Ok(ValidateCallbackResult::Invalid(format!(
           "a message may be edited for {} days after it was sent",
           EDIT_WINDOW_MICROS / (24 * 60 * 60 * 1_000_000)

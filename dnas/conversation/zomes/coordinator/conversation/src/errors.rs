@@ -17,6 +17,16 @@ pub enum ConversationError {
   /// See `conversation_properties` in `lib.rs`.
   #[error("This cell holds no conversation")]
   NotAConversation,
+
+  /// A participant is already admitted by identity and needs no proof, so inviting one as an
+  /// administrator would issue a proof that `check_agent` never consults.
+  #[error("That agent is already a participant in this conversation")]
+  AlreadyAParticipant,
+
+  /// Validation refuses the update regardless; this turns it into a readable error before
+  /// anything is committed. See `within_edit_window` in the integrity crate.
+  #[error("This message can no longer be edited")]
+  EditWindowClosed,
 }
 
 impl From<ConversationError> for WasmError {
