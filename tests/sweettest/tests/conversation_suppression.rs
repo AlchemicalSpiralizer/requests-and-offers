@@ -126,27 +126,23 @@ async fn a_message_bucketed_against_the_wrong_window_is_rejected() {
     assert_call_refused(result, "does not match the bucket its timestamp falls in");
 }
 
-/// An agent deleting a link they authored is permitted.
+/// No link in a conversation may be deleted, by anyone, including the agent who created it.
 ///
-/// The guard refuses a delete-link action authored by anyone but the link's author, which Holochain
-/// does not require: without it either participant could remove the other's message links and empty
-/// the thread index for every reader. Suppressing the other party rather than hiding one's own,
-/// which makes it the worse of the two vectors.
+/// A link delete is an appended action rather than an erasure, but a tombstoned link stops being
+/// returned by `get_links`, so deleting one removes a message from the index while the entry stays
+/// on its author's chain. An invited administrator walking the index would not find it.
 ///
-/// This test asserts the permitted half, because a single-agent clone cannot produce the refused
-/// half: the only links present are ones this agent created. Proving the refusal needs a second
-/// agent inside the clone, which the clone lifecycle harness will provide.
+/// Restricting deletes to the link's author would have licensed exactly that, for one's own
+/// messages, which is the outcome the misfiled-link guard exists to prevent. Retracting something
+/// said is an edit within its window or a client-side marker, never a change to what the index
+/// reports.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_author_may_delete_their_own_message_link() {
+async fn a_message_link_cannot_be_deleted() {
     let mut conductor = SweetConductor::from_standard_config().await;
-    let (cell_id, _, alice, _app_id) = conversation_with_one_message(&conductor).await;
-    let dna_hash = cell_id.dna_hash().clone();
+    let (cell_id, _, _alice, _app_id) = conversation_with_one_message(&conductor).await;
 
     let hostile = swap_in_hostile_coordinator(&mut conductor, cell_id).await;
 
-    // The current bucket, not the start bucket. `start_bucket` is a floor; an honest message is
-    // filed under whatever window its timestamp falls in, which the sibling test shows is 689 at
-    // the time of writing rather than a fixed value.
     let bucket = current_bucket();
 
     let link_hashes: Vec<ActionHash> = conductor
@@ -159,24 +155,9 @@ async fn an_author_may_delete_their_own_message_link() {
         "the honest message should have left exactly one link"
     );
 
-    let _: ActionHash = conductor
-        .call(&hostile, "delete_any_link", link_hashes[0].clone())
+    let result: Result<ActionHash, _> = conductor
+        .call_fallible(&hostile, "delete_any_link", link_hashes[0].clone())
         .await;
 
-    await_ops_integrated(&conductor, &dna_hash, &alice).await;
-
-    let dht_db = conductor
-        .raw_handle()
-        .get_dht_db(&dna_hash)
-        .expect("the conversation dht database should exist");
-
-    let invalid = conductor
-        .get_invalid_integrated_ops(&dht_db)
-        .await
-        .expect("reading invalid integrated ops should succeed");
-
-    assert!(
-        invalid.is_empty(),
-        "an agent deleting a link they authored is permitted, so nothing should be rejected"
-    );
+    assert_call_refused(result, "links are not deletable in a conversation");
 }

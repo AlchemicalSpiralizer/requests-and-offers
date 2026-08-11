@@ -480,21 +480,21 @@ fn validate_message_link(
   Ok(ValidateCallbackResult::Valid)
 }
 
-/// NOT IN THE DESIGN NOTE. Holochain does not require the author of a delete-link action to
-/// be the author of the link it deletes. Without this check either participant could remove
-/// the other's message links, emptying the thread's index for everyone who reads it,
-/// including an invited administrator. Suppressing the other party's messages rather than
-/// merely hiding one's own, so this matters more than the misfiling above.
-fn validate_delete_link_author(
-  original_action: &CreateLink,
-  deleting_author: &AgentPubKey,
-) -> ExternResult<ValidateCallbackResult> {
-  match &original_action.author == deleting_author {
-    true => Ok(ValidateCallbackResult::Valid),
-    false => Ok(ValidateCallbackResult::Invalid(
-      "only the agent who created a link may delete it".to_string(),
-    )),
-  }
+/// NOT IN THE DESIGN NOTE. A link delete is itself an appended action rather than an erasure,
+/// but a tombstoned link stops being returned by `get_links`, so deleting one removes a message
+/// from the index while the entry remains on the chain. That is suppression by another route, and
+/// the author's own messages are no exception: restricting deletes to the link's author would
+/// license exactly the self-suppression `validate_message_link` above exists to prevent.
+///
+/// So no link in a conversation is deletable, mirroring `reject_delete` for entries. Nothing in
+/// the coordinator deletes links. Archiving is disabling the clone, removal is uninstalling it,
+/// and retracting something said is an edit within its window or a client-side marker, never a
+/// change to what the index reports.
+fn reject_link_delete() -> ExternResult<ValidateCallbackResult> {
+  Ok(ValidateCallbackResult::Invalid(
+    "links are not deletable in a conversation; a message removed from the index would be hidden      from every reader while remaining on its author's chain"
+      .to_string(),
+  ))
 }
 
 /// NOT IN THE DESIGN NOTE. The same forgery one layer down: linking an entry you authored
@@ -606,15 +606,11 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
       }
     }
 
-    FlatOp::RegisterDeleteLink {
-      original_action,
-      action,
-      ..
-    } => {
+    FlatOp::RegisterDeleteLink { .. } => {
       if !in_conversation {
         return refuse_base_cell_write();
       }
-      validate_delete_link_author(&original_action, &action.author)
+      reject_link_delete()
     }
 
     FlatOp::StoreRecord(store_record) => match store_record {
