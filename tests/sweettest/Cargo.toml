@@ -79,3 +79,7 @@ path = "tests/mediums_of_exchange.rs"
 [[test]]
 name = "conversation_membrane"
 path = "tests/conversation_membrane.rs"
+
+[[test]]
+name = "conversation_properties"
+path = "tests/conversation_properties.rs"
