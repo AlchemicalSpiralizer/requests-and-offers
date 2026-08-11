@@ -7,6 +7,7 @@
 //! it needs `ConductorHandle::install_app_bundle`, which is public and takes a
 //! per-role `RoleSettings::Provisioned { membrane_proof, modifiers }`.
 
+use holochain::conductor::api::error::ConductorApiError;
 use holochain::conductor::error::ConductorResult;
 use holochain::prelude::*;
 use holochain::sweettest::*;
@@ -159,6 +160,55 @@ pub async fn install_with_conversation(
             ignore_genesis_failure: true,
         })
         .await
+}
+
+/// Enable the app and hand back a callable handle on the conversation coordinator zome.
+///
+/// `install_with_conversation` installs but does not enable, and a disabled app has no running
+/// cell to call. The cell id is built rather than read: `AppRolePrimary` records the role's
+/// `base_dna_hash` and the agent is always the one the app was installed for, so those two
+/// compose into the `CellId`.
+pub async fn enable_conversation_zome(
+    conductor: &SweetConductor,
+    installed: &InstalledApp,
+    agent: &AgentPubKey,
+) -> SweetZome {
+    conductor
+        .raw_handle()
+        .enable_app(installed.installed_app_id.clone())
+        .await
+        .expect("enabling the installed app should succeed");
+
+    let primary = installed
+        .role_assignments()
+        .get(CONVERSATION_ROLE)
+        .expect("happ.yaml should declare a conversation role")
+        .as_primary()
+        .expect("the conversation role is provisioned by this app, not a dependency");
+
+    let cell_id = CellId::new(primary.base_dna_hash.clone(), agent.clone());
+
+    SweetZome::new(cell_id, CONVERSATION_ROLE.into())
+}
+
+/// Assert a zome call was refused, and refused for the expected reason.
+///
+/// Separate from `assert_refused`: that one reads a genesis failure from an install, where a
+/// refused zome call surfaces validation text through a different error type.
+pub fn assert_call_refused<T: std::fmt::Debug>(
+    result: Result<T, ConductorApiError>,
+    expected: &str,
+) {
+    match result {
+        Ok(value) => panic!("expected the call to be refused, but it returned {value:?}"),
+        Err(err) => {
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(expected),
+                "refused, but not for the expected reason.\n  expected: {expected}\n  actual: {text}"
+            );
+        }
+    }
 }
 
 /// Assert an install was refused, and refused for the expected reason.

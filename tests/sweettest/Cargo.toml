@@ -83,3 +83,7 @@ path = "tests/conversation_membrane.rs"
 [[test]]
 name = "conversation_properties"
 path = "tests/conversation_properties.rs"
+
+[[test]]
+name = "conversation_messages"
+path = "tests/conversation_messages.rs"
