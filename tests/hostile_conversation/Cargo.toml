@@ -1,0 +1,28 @@
+# A coordinator zome that deliberately violates the conversation DNA's rules, used to prove the
+# integrity zome refuses what a modified coordinator would write.
+#
+# This is the real threat model rather than a simulation of it: Holochain computes the DNA hash
+# over integrity zomes and modifiers only, so a participant can swap their coordinator at runtime
+# and stay in the same network. `SweetConductor::update_coordinators` does exactly that.
+#
+# NEVER add this zome to `dnas/conversation/workdir/dna.yaml`. Packing is driven by that file, so
+# a workspace member that is not named there compiles but is never bundled. The crate lives under
+# `tests/` and emits `hostile_conversation.wasm`, deliberately distinct from the production
+# coordinator's `conversation.wasm`, so it cannot overwrite the artefact `dna.yaml` points at.
+[package]
+name = "hostile_conversation"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "hostile_conversation"
+
+[dependencies]
+hdk = { workspace = true }
+serde = { workspace = true }
+
+# The real integrity crate, so entry and link types are byte-identical to production. A mirrored
+# copy could drift and the test would then prove nothing.
+conversation_integrity = { workspace = true }

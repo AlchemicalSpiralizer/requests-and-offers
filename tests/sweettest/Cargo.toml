@@ -87,3 +87,7 @@ path = "tests/conversation_properties.rs"
 [[test]]
 name = "conversation_messages"
 path = "tests/conversation_messages.rs"
+
+[[test]]
+name = "conversation_suppression"
+path = "tests/conversation_suppression.rs"

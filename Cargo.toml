@@ -10,6 +10,7 @@ members = [
   "dnas/*/zomes/coordinator/*",
   "dnas/*/zomes/integrity/*",
   "tests/sweettest",
+  "tests/hostile_conversation",
 ]
 # Exclude sweettest from the default workspace build.
 # It has native-only deps (holochain, tokio) that cannot compile to wasm32.
@@ -18,6 +19,8 @@ default-members = [
   "dnas/requests_and_offers/utils",
   "dnas/*/zomes/coordinator/*",
   "dnas/*/zomes/integrity/*",
+  # Compiles to wasm with the real zomes but is never packed: see its Cargo.toml.
+  "tests/hostile_conversation",
 ]
 resolver = "2"
 

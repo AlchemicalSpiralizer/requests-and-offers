@@ -241,6 +241,91 @@ pub async fn enable_conversation_zome(
     SweetZome::new(cell_id, CONVERSATION_ROLE.into())
 }
 
+/// The compiled hostile coordinator, built by `bun run build:zomes` alongside the real zomes.
+pub const HOSTILE_WASM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32-unknown-unknown/release/hostile_conversation.wasm"
+);
+
+/// The name of the hostile coordinator zome once swapped in.
+pub const HOSTILE_ZOME: &str = "hostile_conversation";
+
+/// Replace the cell's coordinator with one that deliberately breaks the rules.
+///
+/// This is the threat model rather than a simulation of it. Holochain computes the DNA hash over
+/// integrity zomes and modifiers only, so a participant can swap their coordinator at runtime and
+/// remain in the same network with the same validation. Everything the hostile zome writes goes
+/// through the ordinary commit path and the ordinary workflows.
+///
+/// The swap *replaces* the production coordinator, so the honest functions are gone afterwards.
+/// Commit anything a test needs honestly before calling this, which is also how a real bad actor
+/// behaves: ordinarily, until they do not.
+///
+/// `dependencies` must name the integrity zome exactly as `dna.yaml` does. Without it the hostile
+/// zome's `EntryTypes` and `LinkTypes` resolve to the wrong zome index and every write fails for
+/// the wrong reason.
+pub async fn swap_in_hostile_coordinator(
+    conductor: &mut SweetConductor,
+    cell_id: CellId,
+) -> SweetZome {
+    let bytes = std::fs::read(HOSTILE_WASM_PATH)
+        .expect("the hostile coordinator wasm should exist; run bun run build:zomes");
+
+    let wasm = DnaWasm::from(bytes);
+    let hashed = DnaWasmHashed::from_content(wasm.clone()).await;
+
+    let def: CoordinatorZomeDef = ZomeDef::Wasm(WasmZome {
+        wasm_hash: hashed.into_hash(),
+        dependencies: vec!["conversation_integrity".into()],
+    })
+    .into();
+
+    conductor
+        .update_coordinators(
+            cell_id.clone(),
+            vec![(HOSTILE_ZOME.into(), def)],
+            vec![wasm],
+        )
+        .await
+        .expect("swapping the coordinator should succeed; the dna hash does not change");
+
+    // A restart, because nothing lighter works. `Conductor::update_coordinators` mutates the
+    // existing ribosome's `dna_file` and re-stores the same object, but `zome_dependencies` is a
+    // separate field computed only in `RealRibosome::new` (`real_ribosome.rs` lines 314 to 340) and
+    // read by `get_zome_dependencies` at line 634. A swapped-in zome therefore has no entry and
+    // every call fails with MissingDependenciesForZome. Disabling and re-enabling the app reuses
+    // the stored ribosome, so it does not help.
+    //
+    // The persisted state is correct: `put_code_and_defs_in_databases` wrote the new DnaDef and
+    // wasm. Restarting with `ignore_dna_files_cache` true reconstructs the ribosome from the
+    // database, which computes the dependency map with the hostile zome included.
+    conductor.shutdown().await;
+    conductor.startup(true).await;
+
+    SweetZome::new(cell_id, HOSTILE_ZOME.into())
+}
+
+/// Wait until every op authored by `agent` has been integrated, so a validation outcome is
+/// readable rather than pending. Needed only where a test asserts that nothing was rejected.
+pub async fn await_ops_integrated(
+    conductor: &SweetConductor,
+    dna_hash: &DnaHash,
+    agent: &AgentPubKey,
+) {
+    for _ in 0..150 {
+        if conductor
+            .all_ops_of_author_integrated(dna_hash, agent)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    panic!("ops authored by the agent were still not integrated after thirty seconds");
+}
+
 /// Assert a zome call was refused, and refused for the expected reason.
 ///
 /// Separate from `assert_refused`: that one reads a genesis failure from an install, where a

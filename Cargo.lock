@@ -3278,6 +3278,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostile_conversation"
+version = "0.0.1"
+dependencies = [
+ "conversation_integrity",
+ "hdk",
+ "serde",
+]
+
+[[package]]
 name = "hostname"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
