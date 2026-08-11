@@ -129,6 +129,54 @@ pub fn conversation_properties_full(
     YamlProperties::new(serde_yaml::to_value(props).expect("properties should serialise to YAML"))
 }
 
+/// Panic if the packed bundle predates any zome source, naming the fix.
+///
+/// `HAPP_PATH` is read from disk with no freshness check, so a bundle built before the source
+/// it is meant to contain fails later and unhelpfully: a missing extern surfaces as
+/// `ZomeFnNotExists`, which reads as a code bug rather than a stale artefact. This turns that
+/// into an instruction.
+fn assert_bundle_is_current() {
+    let bundle = std::fs::metadata(HAPP_PATH)
+        .and_then(|m| m.modified())
+        .expect("the packed bundle should exist; run bun run build:happ");
+
+    let dnas = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dnas");
+    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+
+    let mut stack = vec![dnas];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                // `target` holds build output, which is newer than the bundle by construction.
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs" || e == "yaml") {
+                if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                    if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
+                        newest = Some((path, modified));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((path, modified)) = newest {
+        assert!(
+            bundle >= modified,
+            "the packed bundle is older than {}.\n  run: bun run build:happ",
+            path.display()
+        );
+    }
+}
+
 /// Install the hApp on `conductor`, provisioning the conversation role with the given
 /// properties and optional membrane proof.
 ///
@@ -140,6 +188,8 @@ pub async fn install_with_conversation(
     membrane_proof: Option<MembraneProof>,
     agent: Option<AgentPubKey>,
 ) -> ConductorResult<InstalledApp> {
+    assert_bundle_is_current();
+
     let mut roles_settings: RoleSettingsMap = HashMap::new();
     roles_settings.insert(
         CONVERSATION_ROLE.to_string(),
